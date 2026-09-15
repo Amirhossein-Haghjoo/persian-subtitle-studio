@@ -15,10 +15,10 @@
     "fa_srt",
     "fa_audio"
   ],
-  "highlight_style": "none",
+  "highlight_style": "bold",
   "highlight_color": "#FFC857",
   "tts_engine": "auto",
   "tts_voice": "fa-IR-DilaraNeural",
-  "tts_rate": "+10%",
+  "tts_rate": "+0%",
   "tts_mode": "timed"
 }

@@ -37,10 +37,18 @@ DEFAULT_VOICE = "fa-IR-DilaraNeural"
 # We correct a clip's speed only after actually measuring it, never by
 # guessing from text length (guesses don't account for numbers, punctuation,
 # or transliterated terms, and produced inconsistent results).
-RATE_CORRECTION_TOLERANCE = 0.03     # correct almost everything; ignore only <3% (inaudible)
+#
+# Philosophy: we do NOT try to force a clip to exactly match its subtitle's
+# own duration. If a sentence sounds completely natural at normal pace and
+# finishes before the NEXT sentence needs to start, that's fine — we leave it
+# alone. We only ever speed a clip up, and only enough to avoid it running
+# into the next sentence. We never slow a clip down: playing early and then
+# waiting in silence is completely natural; artificially stretching speech
+# to fill a time slot is not.
+RATE_CORRECTION_TOLERANCE = 0.03     # ignore overrun smaller than 3% (inaudible)
+MIN_GAP_BEFORE_NEXT_MS = 120         # always leave at least this much silence before the next line
 MAX_CORRECTION_ATTEMPTS = 2          # each attempt re-measures and refines further
-MAX_ADAPTIVE_SPEEDUP_PERCENT = 35    # how much faster we'll ask the voice to go
-MAX_ADAPTIVE_SLOWDOWN_PERCENT = -15  # how much slower, if a line is very short
+MAX_ADAPTIVE_SPEEDUP_PERCENT = 35    # how much faster we'll ask the voice to go, at most
 MAX_POST_SPEEDUP = 1.15              # last-resort digital speedup, kept subtle
 
 
@@ -112,21 +120,64 @@ def _measure_ms(path: Path):
         return None
 
 
-def _corrected_rate(measured_ms: float, slot_ms: float, base_rate: str) -> str:
+def _corrected_rate(measured_ms: float, budget_ms: float, base_rate: str) -> str:
     """Given how long a clip ACTUALLY turned out to be (not a guess), computes
-    the rate needed to make it fit its subtitle slot."""
+    the rate needed to fit it within budget_ms. Only ever speeds up — if the
+    clip is already shorter than the budget, the caller shouldn't call this
+    at all (natural pace is always preferred over artificial slowdown)."""
     base_percent = _parse_rate_percent(base_rate)
-    ratio = measured_ms / slot_ms
-    extra_percent = (ratio - 1) * 100
-    extra_percent = max(MAX_ADAPTIVE_SLOWDOWN_PERCENT, min(MAX_ADAPTIVE_SPEEDUP_PERCENT, extra_percent))
+    ratio = measured_ms / budget_ms
+    extra_percent = max(0.0, min(MAX_ADAPTIVE_SPEEDUP_PERCENT, (ratio - 1) * 100))
     combined = max(-50.0, min(60.0, base_percent + extra_percent))
     sign = "+" if combined >= 0 else ""
     return f"{sign}{combined:.0f}%"
 
 
-# --------------------------------------------------------------------------
-# Engines: each one renders a single piece of text into an mp3 file
-# --------------------------------------------------------------------------
+# Terminal punctuation that marks a sentence as actually finished. If a cue's
+# text does NOT end in one of these, the next cue is treated as a
+# continuation of the same sentence rather than a new one.
+_SENTENCE_END = ".!؟?…"
+# If the gap between two cues is larger than this, don't merge them even if
+# punctuation suggests they continue — a long pause usually means the
+# speaker actually paused (or Whisper just split awkwardly).
+MAX_MERGE_GAP_MS = 900
+MAX_GROUP_CUES = 6  # safety cap so one bad transcript can't merge the whole video
+
+
+def _group_cues(cues, spoken):
+    """Groups consecutive cues that are really one sentence split across
+    subtitle blocks, so they get spoken as a single fluid clip instead of
+    with an artificial pause in the middle of a sentence — most noticeable,
+    and worst-sounding, when the two cues are close together in time.
+
+    Returns a list of groups; each group is a list of cue indices.
+    """
+    groups = []
+    current = []
+
+    for i in range(len(cues)):
+        text = (spoken[i] or "").strip()
+        if not text:
+            if current:
+                groups.append(current)
+                current = []
+            continue
+
+        if current:
+            prev_i = current[-1]
+            prev_text = (spoken[prev_i] or "").strip()
+            gap_ms = (cues[i][1] - cues[prev_i][2]) * 1000
+            prev_finished = bool(prev_text) and prev_text[-1] in _SENTENCE_END
+            can_merge = (not prev_finished) and gap_ms <= MAX_MERGE_GAP_MS and len(current) < MAX_GROUP_CUES
+            if not can_merge:
+                groups.append(current)
+                current = []
+
+        current.append(i)
+
+    if current:
+        groups.append(current)
+    return groups
 
 def _speak_edge(text: str, out_path: Path, voice: str, rate: str = "+0%"):
     import edge_tts
@@ -230,52 +281,77 @@ def synthesize_cues(cues, out_path: Path, texts=None, engine: str = "auto",
 
 def _render_clips(cues, spoken, tmp_dir, speak, voice, rate, log, progress,
                   adaptive=False, engine_name=""):
-    """Renders every cue to its own temp mp3. Returns [(cue_index, path)].
+    """Renders one clip per GROUP of cues (see _group_cues), not per raw
+    subtitle line — so a sentence split across two+ subtitle blocks is
+    spoken fluidly as one clip instead of with a pause stuck in the middle
+    of it. Returns [(group, clip_path)] where group is a list of the
+    original cue indices that clip covers.
 
     When adaptive=True, each clip is rendered at the base rate, its REAL
-    duration is measured, and — unless it's already within 3% of its
-    subtitle slot — it's re-rendered with a corrected rate. This repeats up
-    to MAX_CORRECTION_ATTEMPTS times, refining further each time based on
-    what the voice actually did, not a text-length guess. In practice this
-    means nearly every line gets fine-tuned, not just the obvious outliers.
+    duration is measured against the group's combined time slot, and —
+    unless it's already within 3% — it's re-rendered with a corrected rate.
+    This repeats up to MAX_CORRECTION_ATTEMPTS times, refining further each
+    time based on what the voice actually did, not a text-length guess.
     """
+    groups = _group_cues(cues, spoken)
     clips = []
     total = len(cues)
+    done = 0
     failures = 0
     corrections = 0
+    untouched = 0
+    merged_count = sum(1 for g in groups if len(g) > 1)
+    if merged_count:
+        log(f"  ℹ️ {merged_count} جمله که بین چند زیرنویس شکسته شده بود، یکپارچه خوانده می‌شود.")
+
     # gTTS ignores the rate parameter entirely, so re-rendering it would be
     # pointless — only Edge's voices actually respond to a rate change.
     can_correct = adaptive and engine_name == "edge"
 
-    for i, (cue, text) in enumerate(zip(cues, spoken)):
-        text = (text or "").strip()
+    # How much time each group actually has before the NEXT group's audio
+    # starts — this is the real constraint (avoid two lines overlapping),
+    # not the subtitle's own on-screen duration.
+    group_start_ms = [cues[g[0]][1] * 1000 for g in groups]
+
+    for gi, group in enumerate(groups):
+        text = " ".join((spoken[i] or "").strip() for i in group).strip()
+        text = re.sub(r"\s+", " ", text)
         if not text:
+            done += len(group)
             continue
 
-        clip_path = tmp_dir / f"clip_{i:05d}.mp3"
+        if gi + 1 < len(groups):
+            budget_ms = group_start_ms[gi + 1] - group_start_ms[gi] - MIN_GAP_BEFORE_NEXT_MS
+        else:
+            budget_ms = None  # last group: nothing after it to collide with
+
+        clip_path = tmp_dir / f"clip_{gi:05d}.mp3"
         try:
             speak(text, clip_path, voice, rate)
         except Exception as e:
             failures += 1
-            log(f"  ⚠️ تبدیل خط {i+1} به گفتار ناموفق بود: {e}")
-            if failures > max(5, total // 10):
+            log(f"  ⚠️ تبدیل خط {group[0]+1} به گفتار ناموفق بود: {e}")
+            if failures > max(5, len(groups) // 10):
                 raise TTSError(
                     "تبدیل متن به گفتار بارها ناموفق بود. معمولاً یعنی اتصال اینترنت "
                     f"برقرار نیست یا سرویس در دسترس نیست. آخرین خطا: {e}"
                 ) from e
+            done += len(group)
             continue
 
-        if can_correct:
-            slot_ms = (cue[2] - cue[1]) * 1000
+        if can_correct and budget_ms and budget_ms > 100:
             current_rate = rate
             for attempt in range(MAX_CORRECTION_ATTEMPTS):
                 measured_ms = _measure_ms(clip_path)
-                if not measured_ms or slot_ms <= 300:
+                if not measured_ms:
                     break
-                ratio = measured_ms / slot_ms
-                if abs(ratio - 1) <= RATE_CORRECTION_TOLERANCE:
+                # Natural pace already fits before the next line starts —
+                # leave it exactly as it is. No slowdown, no unnecessary tweak.
+                if measured_ms <= budget_ms * (1 + RATE_CORRECTION_TOLERANCE):
+                    if attempt == 0:
+                        untouched += 1
                     break
-                fixed_rate = _corrected_rate(measured_ms, slot_ms, current_rate)
+                fixed_rate = _corrected_rate(measured_ms, budget_ms, current_rate)
                 if fixed_rate == current_rate:
                     break  # already at the speed cap, more attempts won't help
                 try:
@@ -283,67 +359,77 @@ def _render_clips(cues, spoken, tmp_dir, speak, voice, rate, log, progress,
                     current_rate = fixed_rate
                     corrections += 1
                 except Exception as e:
-                    log(f"  ⚠️ اصلاح سرعت خط {i+1} ناموفق بود، نسخه‌ی قبلی نگه داشته شد: {e}")
+                    log(f"  ⚠️ اصلاح سرعت خط {group[0]+1} ناموفق بود، نسخه‌ی قبلی نگه داشته شد: {e}")
                     break
+        elif can_correct:
+            untouched += 1
 
         if clip_path.exists() and clip_path.stat().st_size > 0:
-            clips.append((i, clip_path))
+            clips.append((group, clip_path))
 
+        done += len(group)
         if progress:
-            progress(min((i + 1) / total, 1.0), extra={"done": i + 1, "total": total})
+            progress(min(done / total, 1.0), extra={"done": done, "total": total})
 
-    if corrections:
-        log(f"  ℹ️ سرعت {corrections} خط برای هم‌زمانی با زیرنویس دقیق‌تر تنظیم شد "
-            "(بر اساس اندازه‌گیری واقعی، نه حدس).")
+    if corrections or untouched:
+        log(f"  ℹ️ {untouched} جمله با سرعت طبیعی خونده شد، سرعت {corrections} جمله "
+            "برای جلوگیری از تداخل با جمله‌ی بعدی کمی تنظیم شد.")
 
     return clips
 
 
 def _assemble_timed(clips, cues, out_path, fit_to_timing, log):
-    """Places every clip at its real subtitle timestamp on a silent track."""
+    """Places every clip at its group's real subtitle timestamp on a silent
+    track. A group spanning multiple cues (a merged sentence) is placed once,
+    starting at its first cue. Clips are only ever shortened (never
+    stretched) if they'd otherwise run into the next clip's start time."""
     AudioSegment = _require_pydub()
 
     total_ms = int(max(c[2] for c in cues) * 1000) + 2000
     track = AudioSegment.silent(duration=total_ms)
     overflow = 0
 
-    for idx, clip_path in clips:
+    start_positions = [int(cues[group[0]][1] * 1000) for group, _ in clips]
+
+    for k, (group, clip_path) in enumerate(clips):
         try:
             audio = AudioSegment.from_file(clip_path)
         except Exception as e:
-            log(f"  ⚠️ خواندن قطعه‌ی صوتی {idx+1} ناموفق بود: {e}")
+            log(f"  ⚠️ خواندن قطعه‌ی صوتی {group[0]+1} ناموفق بود: {e}")
             continue
 
         audio = _trim_silence(audio)
+        start_ms = start_positions[k]
 
-        start_ms = int(cues[idx][1] * 1000)
-        slot_ms = int((cues[idx][2] - cues[idx][1]) * 1000)
-
-        # The adaptive speaking rate (set before rendering) already does the
-        # heavy lifting of fitting the line into its slot. This is only a
-        # small last-resort correction for whatever's left over, so it never
-        # produces the harsh "chipmunk" effect of a large digital speedup.
-        if fit_to_timing and slot_ms > 300 and len(audio) > slot_ms:
-            speed = min(len(audio) / slot_ms, MAX_POST_SPEEDUP)
-            if speed > 1.02:
-                try:
-                    audio = audio.speedup(playback_speed=speed)
-                except Exception:
-                    pass
-            if len(audio) > slot_ms:
-                overflow += 1
+        # The render-time correction already did the real work of fitting
+        # speech before the next line starts. This is only a tiny mop-up for
+        # whatever's left, so it stays subtle (never the primary mechanism).
+        if fit_to_timing and k + 1 < len(start_positions):
+            budget_ms = start_positions[k + 1] - start_ms - MIN_GAP_BEFORE_NEXT_MS
+            if budget_ms > 300 and len(audio) > budget_ms:
+                speed = min(len(audio) / budget_ms, MAX_POST_SPEEDUP)
+                if speed > 1.02:
+                    try:
+                        audio = audio.speedup(playback_speed=speed)
+                    except Exception:
+                        pass
+                if len(audio) > budget_ms:
+                    overflow += 1
 
         track = track.overlay(audio, position=start_ms)
 
     if overflow:
-        log(f"  ℹ️ {overflow} بخش کمی بلندتر از بازه‌ی زیرنویس بود و با بخش بعدی هم‌پوشانی دارد.")
+        log(f"  ℹ️ {overflow} جمله کمی بلندتر از فاصله‌ی تا جمله‌ی بعدی بود و ممکن است "
+            "خیلی جزئی با آن هم‌پوشانی داشته باشد.")
 
     _export(track, out_path, log)
 
 
 def _assemble_sequential(clips, spoken, out_path, log):
-    """Concatenates clips back to back with a pause sized to the punctuation
-    at the end of each line, for a more natural spoken rhythm."""
+    """Concatenates group clips back to back with a pause sized to the
+    punctuation at the end of each group's LAST line, for a more natural
+    spoken rhythm (no pause is inserted inside a merged sentence, since
+    that's now a single clip)."""
     try:
         AudioSegment = _require_pydub()
     except TTSError:
@@ -355,13 +441,15 @@ def _assemble_sequential(clips, spoken, out_path, log):
         return
 
     track = AudioSegment.empty()
-    for idx, clip_path in clips:
+    for group, clip_path in clips:
         try:
             audio = _trim_silence(AudioSegment.from_file(clip_path))
         except Exception as e:
             log(f"  ⚠️ خواندن یک قطعه‌ی صوتی ناموفق بود: {e}")
             continue
-        track += audio + AudioSegment.silent(duration=_gap_for(spoken[idx] if idx < len(spoken) else ""))
+        last_idx = group[-1]
+        gap_ms = _gap_for(spoken[last_idx] if last_idx < len(spoken) else "")
+        track += audio + AudioSegment.silent(duration=gap_ms)
     _export(track, out_path, log)
 
 
