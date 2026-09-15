@@ -1,102 +1,212 @@
-"""Glue code: video -> English SRT -> Persian SRT."""
+"""Glue code: video -> English SRT -> Persian SRT -> Persian audio.
+
+Every stage is optional and driven by the `outputs` set, so the UI can let the
+user pick exactly which deliverables they want. Progress is reported per stage
+(each stage runs 0% -> 100% on its own) rather than as one blended number.
+"""
 from pathlib import Path
-from typing import List, Union, Optional
+from typing import Iterable, List, Optional, Union
 
 from . import transcriber, translator
 
-# درصد پیشرفت هر مرحله در نوار پیشرفت کل
-TRANSCRIBE_WEIGHT = 0.7
-TRANSLATE_WEIGHT = 0.3
+# Output identifiers used by both the pipeline and the UI.
+OUT_EN_SRT = "en_srt"
+OUT_FA_SRT = "fa_srt"
+OUT_FA_AUDIO = "fa_audio"
+
+OUTPUT_LABELS = {
+    OUT_EN_SRT: "زیرنویس انگلیسی",
+    OUT_FA_SRT: "زیرنویس فارسی",
+    OUT_FA_AUDIO: "صوت فارسی",
+}
+
+# Stage identifiers reported through the progress callback.
+STAGE_LABELS = {
+    "transcribe": "تبدیل صوت به متن انگلیسی",
+    "translate": "تبدیل متن انگلیسی به فارسی",
+    "tts": "تبدیل متن فارسی به صوت",
+    "done": "پایان",
+}
 
 
 class PipelineError(RuntimeError):
     """Raised for known/expected pipeline failures, with a Persian message."""
 
 
-def run_pipeline(input_path: Path, 
-                 api_keys: Union[str, List[str]], 
-                 model_size: str, 
-                 device: str,
-                 language: str = "en", 
-                 models_priority: Optional[Union[str, List[str]]] = None,
-                 log=print, 
-                 progress=None):
-    """Runs the full pipeline.
+def _as_list(value: Union[str, Iterable, None]) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return [str(v).strip() for v in value if str(v).strip()]
 
-    progress, if given, is called as progress(overall_fraction, extra) where
-    overall_fraction is in [0, 1] and extra is a dict with stage-specific details.
+
+def _check_writable(path: Path):
+    """Fails early with a clear message instead of after a long transcription."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        probe = path.parent / ".pearsian_write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except PermissionError as e:
+        raise PipelineError(
+            f"اجازه‌ی نوشتن فایل خروجی در این پوشه وجود ندارد: {path.parent}\n"
+            "ویدیو را در پوشه‌ای دیگر (مثلاً Desktop) بگذار یا برنامه را با دسترسی مدیر اجرا کن."
+        ) from e
+    except OSError as e:
+        raise PipelineError(f"پوشه‌ی خروجی قابل استفاده نیست: {path.parent} ({e})") from e
+
+
+def run_pipeline(input_path: Path,
+                 api_keys: Union[str, List[str]],
+                 model_size: str = "small",
+                 device: str = "cpu",
+                 language: str = "en",
+                 models_priority: Optional[Union[str, List[str]]] = None,
+                 outputs: Optional[Iterable[str]] = None,
+                 highlight_style: str = "both",
+                 highlight_color: str = "#FFC857",
+                 tts_engine: str = "auto",
+                 tts_voice: str = "fa-IR-DilaraNeural",
+                 tts_rate: str = "+0%",
+                 tts_mode: str = "timed",
+                 log=print,
+                 progress=None):
+    """Runs the requested stages and returns a dict of {output_id: Path}.
+
+    progress, if given, is called as progress(stage, fraction, extra) where
+    `stage` is one of STAGE_LABELS and `fraction` is that stage's own 0..1.
     """
     input_path = Path(input_path)
     if not input_path.exists():
         raise PipelineError(f"فایل ورودی پیدا نشد: {input_path}")
+    if input_path.stat().st_size == 0:
+        raise PipelineError("فایل ورودی خالی است.")
 
-    en_srt_path = input_path.with_suffix("").with_suffix(".en.srt")
-    fa_srt_path = input_path.with_suffix("").with_suffix(".fa.srt")
+    outputs = set(outputs or [OUT_EN_SRT, OUT_FA_SRT])
+    unknown = outputs - set(OUTPUT_LABELS)
+    if unknown:
+        raise PipelineError(f"خروجی ناشناخته درخواست شد: {', '.join(sorted(unknown))}")
+    if not outputs:
+        raise PipelineError("حداقل یک خروجی باید انتخاب شود.")
 
-    # تبدیل ورودی کلیدها به لیست (پشتیبانی از رشته جداشده با کاما یا لیست مستقیم)
-    if isinstance(api_keys, str):
-        api_keys_list = [k.strip() for k in api_keys.split(",") if k.strip()]
-    else:
-        api_keys_list = [k.strip() for k in api_keys if k.strip()]
+    base = input_path.with_suffix("")
+    paths = {
+        OUT_EN_SRT: base.with_suffix(".en.srt"),
+        OUT_FA_SRT: base.with_suffix(".fa.srt"),
+        OUT_FA_AUDIO: base.with_suffix(".fa.mp3"),
+    }
+    _check_writable(paths[OUT_EN_SRT])
 
-    if not api_keys_list:
+    # Persian subtitle and Persian audio both require the translation stage.
+    needs_translation = bool(outputs & {OUT_FA_SRT, OUT_FA_AUDIO})
+
+    api_keys_list = _as_list(api_keys)
+    if needs_translation and not api_keys_list:
         raise PipelineError("لطفاً حداقل یک کلید Gemini API معتبر وارد کنید.")
 
-    # تنظیم و آماده‌سازی اولویت مدل‌ها (به‌روزرسانی با مدل‌های معتبر و فعال)
-    if models_priority is None:
-        models_list = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.5-flash", "gemini-3.0-flash"]
-    elif isinstance(models_priority, str):
-        models_list = [m.strip() for m in models_priority.split(",") if m.strip()]
-    else:
-        models_list = models_priority
+    models_list = _as_list(models_priority) or list(translator.DEFAULT_MODELS)
 
-    def _on_transcribe_progress(frac, stage, extra):
-        if progress:
-            progress(frac * TRANSCRIBE_WEIGHT, {"stage": "transcribe", **(extra or {})})
+    # Fail fast on a missing TTS engine rather than after a long transcription.
+    if OUT_FA_AUDIO in outputs:
+        from . import tts
+        if not tts.available_engines():
+            raise PipelineError(
+                "برای ساخت «صوت فارسی» باید یک موتور تبدیل متن به گفتار نصب باشد.\n"
+                "با دستور «pip install edge-tts» نصبش کن و دوباره تلاش کن."
+            )
 
-    def _on_translate_progress(frac, stage, extra):
-        if progress:
-            progress(TRANSCRIBE_WEIGHT + frac * TRANSLATE_WEIGHT, {"stage": "translate", **(extra or {})})
+    results = {}
 
-    # ۱. مرحله تبدیل صدا به زیرنویس انگلیسی
+    def _stage(name):
+        def _cb(frac, extra=None):
+            if progress:
+                progress(name, max(0.0, min(frac, 1.0)), extra or {})
+        return _cb
+
+    # ---- Stage 1: speech -> English text -------------------------------
+    log(f"▶ مرحله ۱: {STAGE_LABELS['transcribe']}")
+    transcribe_cb = _stage("transcribe")
     try:
-        cues = transcriber.transcribe(input_path, model_size, device, language,
-                                       log=log, progress=_on_transcribe_progress)
+        cues = transcriber.transcribe(
+            input_path, model_size, device, language, log=log,
+            progress=lambda frac, stage=None, extra=None: transcribe_cb(frac, extra),
+        )
     except transcriber.TranscriptionError:
         raise
+    except MemoryError as e:
+        raise PipelineError(
+            "حافظه‌ی سیستم برای این مدل کافی نبود. مدل کوچک‌تری (small یا base) انتخاب کن."
+        ) from e
     except Exception as e:
         raise PipelineError(f"خطای غیرمنتظره در مرحله‌ی تبدیل صدا به متن: {e}") from e
 
     if not cues:
-        raise PipelineError("هیچ گفتاری در ویدیو تشخیص داده نشد.")
+        raise PipelineError(
+            "هیچ گفتاری در فایل تشخیص داده نشد. مطمئن شو فایل صدا دارد و زبان گفتار انگلیسی است."
+        )
+    transcribe_cb(1.0, {"done": len(cues), "total": len(cues)})
 
-    transcriber.write_srt(cues, en_srt_path)
-    log(f"زیرنویس انگلیسی ذخیره شد: {en_srt_path}")
+    if OUT_EN_SRT in outputs:
+        transcriber.write_srt(cues, paths[OUT_EN_SRT])
+        results[OUT_EN_SRT] = paths[OUT_EN_SRT]
+        log(f"✔ زیرنویس انگلیسی ذخیره شد: {paths[OUT_EN_SRT]}")
 
-    # ۲. مرحله ترجمه به فارسی (ارسال لیست کلیدها و اولویت مدل‌ها)
-    english_texts = [c[3] for c in cues]
+    if not needs_translation:
+        if progress:
+            progress("done", 1.0, {})
+        return results
+
+    # ---- Stage 2: English text -> Persian text -------------------------
+    log(f"▶ مرحله ۲: {STAGE_LABELS['translate']}")
+    translate_cb = _stage("translate")
     try:
-        persian_texts = translator.translate_lines(
-            texts=english_texts,
+        raw_persian = translator.translate_lines(
+            texts=[c[3] for c in cues],
             api_keys=api_keys_list,
             models_priority=models_list,
             log=log,
-            progress=_on_translate_progress
+            progress=lambda frac, extra=None: translate_cb(frac, extra),
         )
     except translator.TranslationError:
         raise
     except Exception as e:
         raise PipelineError(f"خطای غیرمنتظره در مرحله‌ی ترجمه: {e}") from e
 
-    if len(persian_texts) != len(cues):
-        raise PipelineError("تعداد خطوط ترجمه‌شده با اصل مطابقت ندارد؛ برای جلوگیری از خرابی زمان‌بندی متوقف شد.")
+    if len(raw_persian) != len(cues):
+        raise PipelineError(
+            "تعداد خطوط ترجمه‌شده با اصل مطابقت ندارد؛ برای جلوگیری از خرابی زمان‌بندی متوقف شد."
+        )
+    translate_cb(1.0, {"done": len(cues), "total": len(cues)})
 
-    # ۳. ساخت و ذخیره فایل زیرنویس فارسی نهایی
-    fa_cues = [(c[0], c[1], c[2], persian_texts[i]) for i, c in enumerate(cues)]
-    transcriber.write_srt(fa_cues, fa_srt_path)
-    log(f"زیرنویس فارسی ذخیره شد: {fa_srt_path}")
+    if OUT_FA_SRT in outputs:
+        styled = [translator.to_styled(t, style=highlight_style, color=highlight_color)
+                  for t in raw_persian]
+        fa_cues = [(c[0], c[1], c[2], styled[i]) for i, c in enumerate(cues)]
+        transcriber.write_srt(fa_cues, paths[OUT_FA_SRT])
+        results[OUT_FA_SRT] = paths[OUT_FA_SRT]
+        log(f"✔ زیرنویس فارسی ذخیره شد: {paths[OUT_FA_SRT]}")
+
+    # ---- Stage 3: Persian text -> Persian speech -----------------------
+    if OUT_FA_AUDIO in outputs:
+        from . import tts
+        log(f"▶ مرحله ۳: {STAGE_LABELS['tts']}")
+        tts_cb = _stage("tts")
+        spoken = [translator.to_plain(t) for t in raw_persian]
+        try:
+            tts.synthesize_cues(
+                cues=cues, texts=spoken, out_path=paths[OUT_FA_AUDIO],
+                engine=tts_engine, voice=tts_voice, rate=tts_rate, mode=tts_mode,
+                log=log, progress=lambda frac, extra=None: tts_cb(frac, extra),
+            )
+        except tts.TTSError:
+            raise
+        except Exception as e:
+            raise PipelineError(f"خطای غیرمنتظره در مرحله‌ی ساخت صوت فارسی: {e}") from e
+
+        results[OUT_FA_AUDIO] = paths[OUT_FA_AUDIO]
+        tts_cb(1.0, {"done": len(cues), "total": len(cues)})
 
     if progress:
-        progress(1.0, {"stage": "done"})
-
-    return en_srt_path, fa_srt_path
+        progress("done", 1.0, {})
+    return results
