@@ -1,0 +1,13 @@
+{
+  "api_keys": [
+    "AQ.Ab8RN6LG58gio6mFQvgtRf-bpumgItoeqLYdvQxXXq1K5jyWpw",
+    "AQ.Ab8RN6IBqLgXxgpHMWZpKFk19LzIdXX5iEPaJi85WS4V151WUg"
+  ],
+  "models_priority": [
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-3.1-flash-lite"
+  ],
+  "whisper_model": "small",
+  "device": "cpu"
+}

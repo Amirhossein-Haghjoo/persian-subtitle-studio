@@ -1,170 +1,278 @@
-"""
-Persian Subtitle Maker - Desktop GUI
-Drop in an English video, get back English + Persian subtitles.
-
-Run with:  python app.py
-"""
 import os
-import sys
-import threading
-import traceback
 from pathlib import Path
-from tkinter import (Tk, StringVar, Text, END, DISABLED, NORMAL, WORD,
-                      filedialog, messagebox, ttk)
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
-sys.path.insert(0, str(Path(__file__).parent))
-from src import config as cfg
-from src.pipeline import run_pipeline
+from src import config, pipeline
 
 
-class App:
-    def __init__(self, root: Tk):
-        self.root = root
-        self.root.title("زیرنویس‌ساز فارسی")
-        self.root.geometry("640x560")
-        self.root.resizable(True, True)
+class GeminiSettingsFrame(ttk.LabelFrame):
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, text="تنظیمات Gemini API و اولویت مدل‌ها", **kwargs)
+        
+        self.key_entries = []
+        self.model_vars = []
+        
+        self.saved_config = config.load_config()
+        
+        self.keys_container = ttk.Frame(self)
+        self.keys_container.pack(fill="x", padx=5, pady=5)
+        
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", padx=5, pady=2)
+        
+        self.add_key_btn = ttk.Button(btn_frame, text="+ افزودن کلید جدید", command=self.add_key_field)
+        self.add_key_btn.pack(side="right", padx=5)
+        
+        self.save_btn = ttk.Button(btn_frame, text="💾 ذخیره تنظیمات", command=self.save_settings)
+        self.save_btn.pack(side="left", padx=5)
 
-        self.settings = cfg.load_config()
-        self.selected_file = StringVar(value="")
-        self.model_var = StringVar(value=self.settings.get("whisper_model", "medium"))
-        self.device_var = StringVar(value=self.settings.get("device", "cpu"))
-        self.api_key_var = StringVar(value=self.settings.get("gemini_api_key", ""))
+        saved_keys = self.saved_config.get("api_keys", [])
+        if saved_keys:
+            for k in saved_keys:
+                self.add_key_field(initial_value=k)
+        else:
+            self.add_key_field()
 
-        self.output_paths = None
-        self._build_ui()
+        ttk.Separator(self, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Label(self, text="اولویت اجرای مدل‌ها (سوییچ خودکار در صورت خطای ۴۲۹):").pack(anchor="w", padx=5)
+        
+        self.models_frame = ttk.Frame(self)
+        self.models_frame.pack(fill="x", padx=5, pady=5)
+        
+        self.available_models = [
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+            "gemini-3.1-flash-lite",
+        ]
+        saved_priority = self.saved_config.get("models_priority", self.available_models)
 
-    # ---------- UI ----------
-    def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
+        for idx in range(3):
+            row = ttk.Frame(self.models_frame)
+            row.pack(fill="x", pady=2)
+            
+            ttk.Label(row, text=f"اولویت {idx + 1}:").pack(side="left", padx=5)
+            
+            default_val = saved_priority[idx] if idx < len(saved_priority) else self.available_models[0]
+            var = tk.StringVar(value=default_val)
+            combo = ttk.Combobox(row, textvariable=var, values=self.available_models, state="readonly", width=20)
+            combo.pack(side="left", padx=5)
+            
+            self.model_vars.append(var)
 
-        frm_key = ttk.LabelFrame(self.root, text="کلید Gemini API")
-        frm_key.pack(fill="x", **pad)
-        self.key_entry = ttk.Entry(frm_key, textvariable=self.api_key_var, show="*", width=50)
-        self.key_entry.pack(side="right", padx=8, pady=8, fill="x", expand=True)
-        ttk.Button(frm_key, text="ذخیره کلید", command=self.save_key).pack(side="left", padx=8, pady=8)
+    def _setup_entry_features(self, entry: ttk.Entry):
+        """افزودن قابلیت پیست با کیبورد فارسی و منوی راست‌کلیک"""
+        
+        def paste_from_clipboard(event=None):
+            try:
+                text = self.clipboard_get()
+                if entry.select_present():
+                    entry.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                entry.insert(tk.INSERT, text)
+            except tk.TclError:
+                pass
+            return "break"
 
-        frm_file = ttk.LabelFrame(self.root, text="فایل ویدیو")
-        frm_file.pack(fill="x", **pad)
-        ttk.Button(frm_file, text="انتخاب ویدیو...", command=self.choose_file).pack(side="left", padx=8, pady=8)
-        self.file_label = ttk.Label(frm_file, text="فایلی انتخاب نشده", anchor="e", justify="right")
-        self.file_label.pack(side="right", padx=8, pady=8, fill="x", expand=True)
+        def copy_to_clipboard(event=None):
+            try:
+                if entry.select_present():
+                    text = entry.get()[entry.index(tk.SEL_FIRST):entry.index(tk.SEL_LAST)]
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+            except tk.TclError:
+                pass
+            return "break"
 
-        frm_opts = ttk.LabelFrame(self.root, text="تنظیمات")
-        frm_opts.pack(fill="x", **pad)
+        def cut_to_clipboard(event=None):
+            copy_to_clipboard()
+            try:
+                if entry.select_present():
+                    entry.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            except tk.TclError:
+                pass
+            return "break"
 
-        ttk.Label(frm_opts, text="مدل Whisper:").grid(row=0, column=1, sticky="e", padx=6, pady=6)
-        model_combo = ttk.Combobox(frm_opts, textvariable=self.model_var, state="readonly",
-                                    values=["tiny", "base", "small", "medium", "large-v3"], width=12)
-        model_combo.grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        # میانبرهای کیبورد (حتی با کیبورد فارسی)
+        entry.bind("<Control-v>", paste_from_clipboard)
+        entry.bind("<Control-V>", paste_from_clipboard)
+        entry.bind("<<Paste>>", paste_from_clipboard)
 
-        ttk.Label(frm_opts, text="دستگاه پردازش:").grid(row=1, column=1, sticky="e", padx=6, pady=6)
-        device_combo = ttk.Combobox(frm_opts, textvariable=self.device_var, state="readonly",
-                                     values=["cpu", "cuda"], width=12)
-        device_combo.grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        # ساخت منوی راست‌کلیک
+        context_menu = tk.Menu(entry, tearoff=0)
+        context_menu.add_command(label="برش (Cut)", command=cut_to_clipboard)
+        context_menu.add_command(label="کپی (Copy)", command=copy_to_clipboard)
+        context_menu.add_command(label="چسباندن (Paste)", command=paste_from_clipboard)
+        context_menu.add_separator()
+        context_menu.add_command(label="انتخاب همه", command=lambda: entry.select_range(0, tk.END))
 
-        self.start_btn = ttk.Button(self.root, text="شروع پردازش", command=self.start_clicked)
-        self.start_btn.pack(pady=8)
+        def show_menu(event):
+            context_menu.tk_popup(event.x_root, event.y_root)
 
-        self.progress = ttk.Progressbar(self.root, mode="indeterminate")
-        self.progress.pack(fill="x", padx=10, pady=4)
+        entry.bind("<Button-3>", show_menu)  # راست‌کلیک روی ویندوز
 
-        frm_log = ttk.LabelFrame(self.root, text="روند کار")
-        frm_log.pack(fill="both", expand=True, **pad)
-        self.log_text = Text(frm_log, wrap=WORD, height=14, state=DISABLED)
-        self.log_text.pack(fill="both", expand=True, padx=6, pady=6)
+    def add_key_field(self, initial_value=""):
+        row = ttk.Frame(self.keys_container)
+        row.pack(fill="x", pady=2)
+        
+        lbl = ttk.Label(row, text=f"کلید {len(self.key_entries) + 1}:")
+        lbl.pack(side="left", padx=2)
+        
+        entry = ttk.Entry(row, show="*", width=40)
+        entry.insert(0, initial_value)
+        entry.pack(side="left", fill="x", expand=True, padx=5)
+        
+        # فعال‌سازی راست‌کلیک و کلید میانبر
+        self._setup_entry_features(entry)
 
-        self.open_folder_btn = ttk.Button(self.root, text="باز کردن پوشه‌ی خروجی",
-                                           command=self.open_output_folder, state=DISABLED)
-        self.open_folder_btn.pack(pady=6)
+        # دکمه چسباندن (Paste) مستقیم
+        paste_btn = ttk.Button(row, text="📋 چسباندن", width=9, 
+                               command=lambda e=entry: self._direct_paste(e))
+        paste_btn.pack(side="right", padx=2)
 
-    # ---------- Actions ----------
-    def save_key(self):
-        cfg.save_config({"gemini_api_key": self.api_key_var.get().strip()})
-        messagebox.showinfo("ذخیره شد", "کلید API ذخیره شد.")
+        del_btn = ttk.Button(row, text="✕", width=3, command=lambda: self.remove_key_field(row, entry))
+        del_btn.pack(side="right", padx=2)
+        
+        self.key_entries.append(entry)
 
-    def choose_file(self):
-        path = filedialog.askopenfilename(
-            title="یک فایل ویدیو یا صوتی انتخاب کن",
-            filetypes=[("Video/Audio", "*.mp4 *.mkv *.avi *.mov *.webm *.mp3 *.wav *.m4a"), ("همه فایل‌ها", "*.*")]
-        )
-        if path:
-            self.selected_file.set(path)
-            self.file_label.config(text=Path(path).name)
+    def _direct_paste(self, entry: ttk.Entry):
+        """چسباندن مستقیم از کلیپ‌بورد سیستم با کلیک دکمه"""
+        try:
+            text = self.clipboard_get().strip()
+            entry.delete(0, tk.END)
+            entry.insert(0, text)
+        except tk.TclError:
+            messagebox.showwarning("هشدار", "هیچ متنی در کلیپ‌بورد کپی نشده است.")
+
+    def remove_key_field(self, row_frame, entry_widget):
+        if len(self.key_entries) <= 1:
+            messagebox.showwarning("هشدار", "حداقل باید یک کلید API وجود داشته باشد.")
+            return
+        
+        self.key_entries.remove(entry_widget)
+        row_frame.destroy()
+        self._reindex_labels()
+
+    def _reindex_labels(self):
+        for idx, row in enumerate(self.keys_container.winfo_children()):
+            for child in row.winfo_children():
+                if isinstance(child, ttk.Label):
+                    child.config(text=f"کلید {idx + 1}:")
+
+    def get_api_keys(self) -> list[str]:
+        return [e.get().strip() for e in self.key_entries if e.get().strip()]
+
+    def get_models_priority(self) -> list[str]:
+        priority = []
+        for var in self.model_vars:
+            model = var.get().strip()
+            if model and model not in priority:
+                priority.append(model)
+        return priority
+
+    def save_settings(self):
+        cfg = self.saved_config
+        cfg["api_keys"] = self.get_api_keys()
+        cfg["models_priority"] = self.get_models_priority()
+        
+        if config.save_config(cfg):
+            messagebox.showinfo("موفقیت", "تنظیمات با موفقیت ذخیره شدند.")
+        else:
+            messagebox.showerror("خطا", "ذخیره‌سازی تنظیمات با خطا مواجه شد.")
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("زیرنویس‌ساز فارسی و مترجم هوشمند")
+        self.geometry("680x720")
+        
+        self.saved_cfg = config.load_config()
+
+        self.gemini_frame = GeminiSettingsFrame(self)
+        self.gemini_frame.pack(fill="x", padx=10, pady=5)
+
+        file_frame = ttk.LabelFrame(self, text="فایل ویدیو")
+        file_frame.pack(fill="x", padx=10, pady=5)
+
+        self.file_path_var = tk.StringVar()
+        ttk.Entry(file_frame, textvariable=self.file_path_var, width=50).pack(side="left", padx=5, pady=5, expand=True, fill="x")
+        ttk.Button(file_frame, text="انتخاب ویدیو...", command=self.browse_file).pack(side="right", padx=5, pady=5)
+
+        whisper_frame = ttk.LabelFrame(self, text="تنظیمات Whisper")
+        whisper_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(whisper_frame, text="مدل:").pack(side="left", padx=5)
+        self.whisper_model_var = tk.StringVar(value=self.saved_cfg.get("whisper_model", "small"))
+        ttk.Combobox(whisper_frame, textvariable=self.whisper_model_var, values=["tiny", "base", "small", "medium", "large-v3"], state="readonly", width=10).pack(side="left", padx=5)
+
+        ttk.Label(whisper_frame, text="دستگاه:").pack(side="left", padx=5)
+        self.device_var = tk.StringVar(value=self.saved_cfg.get("device", "cpu"))
+        ttk.Combobox(whisper_frame, textvariable=self.device_var, values=["cpu", "cuda"], state="readonly", width=10).pack(side="left", padx=5)
+
+        self.start_btn = ttk.Button(self, text="شروع پردازش", command=self.start_processing)
+        self.start_btn.pack(pady=10)
+
+        self.progress_bar = ttk.Progressbar(self, mode="determinate")
+        self.progress_bar.pack(fill="x", padx=10, pady=5)
+
+        log_frame = ttk.LabelFrame(self, text="روند کار")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.log_text = tk.Text(log_frame, wrap="word", height=12)
+        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def browse_file(self):
+        filename = filedialog.askopenfilename(filetypes=[("Media Files", "*.mp4 *.mkv *.avi *.mp3 *.wav *.m4a")])
+        if filename:
+            self.file_path_var.set(filename)
 
     def log(self, message: str):
-        def _write():
-            self.log_text.config(state=NORMAL)
-            self.log_text.insert(END, message + "\n")
-            self.log_text.see(END)
-            self.log_text.config(state=DISABLED)
-        self.root.after(0, _write)
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
 
-    def start_clicked(self):
-        video_path = self.selected_file.get()
-        api_key = self.api_key_var.get().strip()
+    def update_progress(self, fraction, extra=None):
+        self.progress_bar["value"] = fraction * 100
 
-        if not video_path:
-            messagebox.showwarning("فایل انتخاب نشده", "لطفاً اول یک فایل ویدیو انتخاب کن.")
-            return
-        if not api_key:
-            messagebox.showwarning("کلید API خالیه", "لطفاً کلید Gemini API رو وارد و ذخیره کن.")
+    def start_processing(self):
+        video_path = self.file_path_var.get().strip()
+        api_keys = self.gemini_frame.get_api_keys()
+        models_priority = self.gemini_frame.get_models_priority()
+
+        if not video_path or not os.path.exists(video_path):
+            messagebox.showerror("خطا", "لطفاً یک فایل ویدیویی معتبر انتخاب کنید.")
             return
 
-        cfg.save_config({
-            "gemini_api_key": api_key,
-            "whisper_model": self.model_var.get(),
-            "device": self.device_var.get(),
-        })
-
-        self.start_btn.config(state=DISABLED)
-        self.open_folder_btn.config(state=DISABLED)
-        self.progress.start(12)
-        self.log_text.config(state=NORMAL)
-        self.log_text.delete("1.0", END)
-        self.log_text.config(state=DISABLED)
-
-        thread = threading.Thread(target=self._run_pipeline_thread,
-                                   args=(video_path, api_key), daemon=True)
-        thread.start()
-
-    def _run_pipeline_thread(self, video_path, api_key):
-        try:
-            en_path, fa_path = run_pipeline(
-                input_path=Path(video_path),
-                api_key=api_key,
-                model_size=self.model_var.get(),
-                device=self.device_var.get(),
-                log=self.log,
-            )
-            self.output_paths = (en_path, fa_path)
-            self.log("تمام شد! زیرنویس فارسی آماده است.")
-            self.root.after(0, lambda: messagebox.showinfo(
-                "تمام شد", f"زیرنویس فارسی ساخته شد:\n{fa_path}"))
-            self.root.after(0, lambda: self.open_folder_btn.config(state=NORMAL))
-        except Exception as e:
-            err = f"خطا: {e}"
-            self.log(err)
-            self.log(traceback.format_exc())
-            self.root.after(0, lambda: messagebox.showerror("خطا", str(e)))
-        finally:
-            self.root.after(0, self.progress.stop)
-            self.root.after(0, lambda: self.start_btn.config(state=NORMAL))
-
-    def open_output_folder(self):
-        if not self.output_paths:
+        if not api_keys:
+            messagebox.showerror("خطا", "لطفاً حداقل یک کلید API وارد کنید.")
             return
-        folder = str(self.output_paths[1].parent)
-        if os.name == "nt":
-            os.startfile(folder)
-        else:
-            os.system(f'xdg-open "{folder}"')
 
+        self.gemini_frame.save_settings()
 
-def main():
-    root = Tk()
-    App(root)
-    root.mainloop()
+        self.start_btn.config(state="disabled")
+        self.log_text.delete("1.0", tk.END)
+
+        def worker():
+            try:
+                pipeline.run_pipeline(
+                    input_path=Path(video_path),
+                    api_keys=api_keys,
+                    models_priority=models_priority,
+                    model_size=self.whisper_model_var.get(),
+                    device=self.device_var.get(),
+                    log=self.log,
+                    progress=self.update_progress
+                )
+                messagebox.showinfo("پایان", "ترجمه و ساخت زیرنویس با موفقیت انجام شد!")
+            except Exception as e:
+                messagebox.showerror("خطا", str(e))
+                self.log(f"\n❌ خطا: {e}")
+            finally:
+                self.start_btn.config(state="normal")
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 if __name__ == "__main__":
-    main()
+    app = App()
+    app.mainloop()
