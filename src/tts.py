@@ -18,6 +18,7 @@ Two assembly modes:
                    beyond the engine, but timing will drift from the video.
 """
 import asyncio
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -27,6 +28,20 @@ PERSIAN_VOICES = {
     "مرد (فرید)": "fa-IR-FaridNeural",
 }
 DEFAULT_VOICE = "fa-IR-DilaraNeural"
+
+# Rough average Persian speaking rate at normal pace, used to estimate how
+# long a line will take to speak before we actually render it. This lets us
+# ask the TTS engine to naturally speak faster/slower to fit a subtitle's
+# time slot, instead of digitally stretching the finished audio (which
+# sounds robotic/chipmunk-y once you go much past ~1.15x).
+# We correct a clip's speed only after actually measuring it, never by
+# guessing from text length (guesses don't account for numbers, punctuation,
+# or transliterated terms, and produced inconsistent results).
+RATE_CORRECTION_TOLERANCE = 0.03     # correct almost everything; ignore only <3% (inaudible)
+MAX_CORRECTION_ATTEMPTS = 2          # each attempt re-measures and refines further
+MAX_ADAPTIVE_SPEEDUP_PERCENT = 35    # how much faster we'll ask the voice to go
+MAX_ADAPTIVE_SLOWDOWN_PERCENT = -15  # how much slower, if a line is very short
+MAX_POST_SPEEDUP = 1.15              # last-resort digital speedup, kept subtle
 
 
 class TTSError(RuntimeError):
@@ -67,6 +82,46 @@ def _require_pydub():
             "برای هم‌زمان‌سازی دقیق صوت با ویدیو به کتابخانه‌ی pydub نیاز است.\n"
             "با دستور «pip install pydub» نصبش کن، یا حالت چیدمان را روی «پشت سر هم» بگذار."
         ) from e
+
+
+def _trim_silence(audio, silence_thresh_db: float = -42.0, chunk_ms: int = 10):
+    """Strips near-silent lead/trail padding that TTS engines often add, so
+    consecutive clips don't accumulate uneven, unpredictable gaps."""
+    from pydub.silence import detect_leading_silence
+
+    start = detect_leading_silence(audio, silence_threshold=silence_thresh_db, chunk_size=chunk_ms)
+    end = detect_leading_silence(audio.reverse(), silence_threshold=silence_thresh_db, chunk_size=chunk_ms)
+    trimmed = audio[start: len(audio) - end]
+    return trimmed if len(trimmed) > 50 else audio  # never trim a clip down to nothing
+
+
+def _parse_rate_percent(rate: str) -> float:
+    try:
+        return float(str(rate).strip().replace("%", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _measure_ms(path: Path):
+    """Returns the real duration of a rendered clip in milliseconds, or None
+    if it can't be measured (pydub missing / unreadable file)."""
+    try:
+        from pydub import AudioSegment
+        return len(AudioSegment.from_file(path))
+    except Exception:
+        return None
+
+
+def _corrected_rate(measured_ms: float, slot_ms: float, base_rate: str) -> str:
+    """Given how long a clip ACTUALLY turned out to be (not a guess), computes
+    the rate needed to make it fit its subtitle slot."""
+    base_percent = _parse_rate_percent(base_rate)
+    ratio = measured_ms / slot_ms
+    extra_percent = (ratio - 1) * 100
+    extra_percent = max(MAX_ADAPTIVE_SLOWDOWN_PERCENT, min(MAX_ADAPTIVE_SPEEDUP_PERCENT, extra_percent))
+    combined = max(-50.0, min(60.0, base_percent + extra_percent))
+    sign = "+" if combined >= 0 else ""
+    return f"{sign}{combined:.0f}%"
 
 
 # --------------------------------------------------------------------------
@@ -153,16 +208,19 @@ def synthesize_cues(cues, out_path: Path, texts=None, engine: str = "auto",
         else:
             _require_pydub()
 
+    adaptive = mode == "timed" and fit_to_timing
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="pearsian_tts_"))
     try:
-        clips = _render_clips(cues, spoken, tmp_dir, speak, voice, rate, log, progress)
+        clips = _render_clips(cues, spoken, tmp_dir, speak, voice, rate, log, progress,
+                              adaptive=adaptive, engine_name=engine_name)
         if not clips:
             raise TTSError("هیچ بخشی از متن با موفقیت به گفتار تبدیل نشد.")
 
         if mode == "timed":
             _assemble_timed(clips, cues, out_path, fit_to_timing, log)
         else:
-            _assemble_sequential(clips, out_path, log)
+            _assemble_sequential(clips, spoken, out_path, log)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -170,11 +228,24 @@ def synthesize_cues(cues, out_path: Path, texts=None, engine: str = "auto",
     return out_path
 
 
-def _render_clips(cues, spoken, tmp_dir, speak, voice, rate, log, progress):
-    """Renders every cue to its own temp mp3. Returns [(cue_index, path)]."""
+def _render_clips(cues, spoken, tmp_dir, speak, voice, rate, log, progress,
+                  adaptive=False, engine_name=""):
+    """Renders every cue to its own temp mp3. Returns [(cue_index, path)].
+
+    When adaptive=True, each clip is rendered at the base rate, its REAL
+    duration is measured, and — unless it's already within 3% of its
+    subtitle slot — it's re-rendered with a corrected rate. This repeats up
+    to MAX_CORRECTION_ATTEMPTS times, refining further each time based on
+    what the voice actually did, not a text-length guess. In practice this
+    means nearly every line gets fine-tuned, not just the obvious outliers.
+    """
     clips = []
     total = len(cues)
     failures = 0
+    corrections = 0
+    # gTTS ignores the rate parameter entirely, so re-rendering it would be
+    # pointless — only Edge's voices actually respond to a rate change.
+    can_correct = adaptive and engine_name == "edge"
 
     for i, (cue, text) in enumerate(zip(cues, spoken)):
         text = (text or "").strip()
@@ -194,11 +265,36 @@ def _render_clips(cues, spoken, tmp_dir, speak, voice, rate, log, progress):
                 ) from e
             continue
 
+        if can_correct:
+            slot_ms = (cue[2] - cue[1]) * 1000
+            current_rate = rate
+            for attempt in range(MAX_CORRECTION_ATTEMPTS):
+                measured_ms = _measure_ms(clip_path)
+                if not measured_ms or slot_ms <= 300:
+                    break
+                ratio = measured_ms / slot_ms
+                if abs(ratio - 1) <= RATE_CORRECTION_TOLERANCE:
+                    break
+                fixed_rate = _corrected_rate(measured_ms, slot_ms, current_rate)
+                if fixed_rate == current_rate:
+                    break  # already at the speed cap, more attempts won't help
+                try:
+                    speak(text, clip_path, voice, fixed_rate)
+                    current_rate = fixed_rate
+                    corrections += 1
+                except Exception as e:
+                    log(f"  ⚠️ اصلاح سرعت خط {i+1} ناموفق بود، نسخه‌ی قبلی نگه داشته شد: {e}")
+                    break
+
         if clip_path.exists() and clip_path.stat().st_size > 0:
             clips.append((i, clip_path))
 
         if progress:
             progress(min((i + 1) / total, 1.0), extra={"done": i + 1, "total": total})
+
+    if corrections:
+        log(f"  ℹ️ سرعت {corrections} خط برای هم‌زمانی با زیرنویس دقیق‌تر تنظیم شد "
+            "(بر اساس اندازه‌گیری واقعی، نه حدس).")
 
     return clips
 
@@ -218,15 +314,22 @@ def _assemble_timed(clips, cues, out_path, fit_to_timing, log):
             log(f"  ⚠️ خواندن قطعه‌ی صوتی {idx+1} ناموفق بود: {e}")
             continue
 
+        audio = _trim_silence(audio)
+
         start_ms = int(cues[idx][1] * 1000)
         slot_ms = int((cues[idx][2] - cues[idx][1]) * 1000)
 
+        # The adaptive speaking rate (set before rendering) already does the
+        # heavy lifting of fitting the line into its slot. This is only a
+        # small last-resort correction for whatever's left over, so it never
+        # produces the harsh "chipmunk" effect of a large digital speedup.
         if fit_to_timing and slot_ms > 300 and len(audio) > slot_ms:
-            speed = min(len(audio) / slot_ms, 1.6)  # don't make it unintelligible
-            try:
-                audio = audio.speedup(playback_speed=speed)
-            except Exception:
-                pass
+            speed = min(len(audio) / slot_ms, MAX_POST_SPEEDUP)
+            if speed > 1.02:
+                try:
+                    audio = audio.speedup(playback_speed=speed)
+                except Exception:
+                    pass
             if len(audio) > slot_ms:
                 overflow += 1
 
@@ -238,8 +341,9 @@ def _assemble_timed(clips, cues, out_path, fit_to_timing, log):
     _export(track, out_path, log)
 
 
-def _assemble_sequential(clips, out_path, log):
-    """Concatenates clips back to back with a short pause between them."""
+def _assemble_sequential(clips, spoken, out_path, log):
+    """Concatenates clips back to back with a pause sized to the punctuation
+    at the end of each line, for a more natural spoken rhythm."""
     try:
         AudioSegment = _require_pydub()
     except TTSError:
@@ -251,13 +355,26 @@ def _assemble_sequential(clips, out_path, log):
         return
 
     track = AudioSegment.empty()
-    gap = AudioSegment.silent(duration=250)
-    for _, clip_path in clips:
+    for idx, clip_path in clips:
         try:
-            track += AudioSegment.from_file(clip_path) + gap
+            audio = _trim_silence(AudioSegment.from_file(clip_path))
         except Exception as e:
             log(f"  ⚠️ خواندن یک قطعه‌ی صوتی ناموفق بود: {e}")
+            continue
+        track += audio + AudioSegment.silent(duration=_gap_for(spoken[idx] if idx < len(spoken) else ""))
     _export(track, out_path, log)
+
+
+def _gap_for(text: str) -> int:
+    """A short pause after commas, a longer one after sentence endings."""
+    text = (text or "").rstrip()
+    if not text:
+        return 200
+    if text[-1] in ".!؟?":
+        return 380
+    if text[-1] in "،,:;":
+        return 180
+    return 250
 
 
 def _export(track, out_path: Path, log):
