@@ -23,10 +23,15 @@ OUTPUT_LABELS = {
 # Stage identifiers reported through the progress callback.
 STAGE_LABELS = {
     "transcribe": "تبدیل صوت به متن انگلیسی",
+    "level_en": "ساده‌سازی زیرنویس انگلیسی طبق سطح زبان",
     "translate": "تبدیل متن انگلیسی به فارسی",
     "tts": "تبدیل متن فارسی به صوت",
     "done": "پایان",
 }
+
+# "original" means: use the transcript exactly as Whisper produced it.
+ENGLISH_LEVELS = ["original"] + translator.CEFR_LEVELS
+PERSIAN_STYLES = ("literal", "friendly")
 
 
 class PipelineError(RuntimeError):
@@ -64,6 +69,8 @@ def run_pipeline(input_path: Path,
                  language: str = "en",
                  models_priority: Optional[Union[str, List[str]]] = None,
                  outputs: Optional[Iterable[str]] = None,
+                 english_level: str = "original",
+                 persian_style: str = "literal",
                  highlight_style: str = "both",
                  highlight_color: str = "#FFC857",
                  tts_engine: str = "auto",
@@ -100,9 +107,11 @@ def run_pipeline(input_path: Path,
 
     # Persian subtitle and Persian audio both require the translation stage.
     needs_translation = bool(outputs & {OUT_FA_SRT, OUT_FA_AUDIO})
+    needs_leveling = OUT_EN_SRT in outputs and english_level not in (None, "original")
+    needs_gemini = needs_translation or needs_leveling
 
     api_keys_list = _as_list(api_keys)
-    if needs_translation and not api_keys_list:
+    if needs_gemini and not api_keys_list:
         raise PipelineError("لطفاً حداقل یک کلید Gemini API معتبر وارد کنید.")
 
     models_list = _as_list(models_priority) or list(translator.DEFAULT_MODELS)
@@ -148,7 +157,32 @@ def run_pipeline(input_path: Path,
     transcribe_cb(1.0, {"done": len(cues), "total": len(cues)})
 
     if OUT_EN_SRT in outputs:
-        transcriber.write_srt(cues, paths[OUT_EN_SRT])
+        english_cues = cues
+        if needs_leveling:
+            log(f"▶ مرحله: {STAGE_LABELS['level_en']} ({english_level})")
+            level_cb = _stage("level_en")
+            try:
+                leveled = translator.simplify_english_lines(
+                    texts=[c[3] for c in cues],
+                    api_keys=api_keys_list,
+                    models_priority=models_list,
+                    level=english_level,
+                    log=log,
+                    progress=lambda frac, extra=None: level_cb(frac, extra),
+                )
+            except translator.TranslationError:
+                raise
+            except Exception as e:
+                raise PipelineError(f"خطای غیرمنتظره در ساده‌سازی زیرنویس انگلیسی: {e}") from e
+
+            if len(leveled) != len(cues):
+                raise PipelineError(
+                    "تعداد خطوط ساده‌شده با اصل مطابقت ندارد؛ برای جلوگیری از خرابی زمان‌بندی متوقف شد."
+                )
+            level_cb(1.0, {"done": len(cues), "total": len(cues)})
+            english_cues = [(c[0], c[1], c[2], leveled[i]) for i, c in enumerate(cues)]
+
+        transcriber.write_srt(english_cues, paths[OUT_EN_SRT])
         results[OUT_EN_SRT] = paths[OUT_EN_SRT]
         log(f"✔ زیرنویس انگلیسی ذخیره شد: {paths[OUT_EN_SRT]}")
 
@@ -158,6 +192,8 @@ def run_pipeline(input_path: Path,
         return results
 
     # ---- Stage 2: English text -> Persian text -------------------------
+    # NOTE: this always uses the ORIGINAL transcript (`cues`), never the
+    # CEFR-leveled English text above — the two settings are independent.
     log(f"▶ مرحله ۲: {STAGE_LABELS['translate']}")
     translate_cb = _stage("translate")
     try:
@@ -165,6 +201,7 @@ def run_pipeline(input_path: Path,
             texts=[c[3] for c in cues],
             api_keys=api_keys_list,
             models_priority=models_list,
+            style=persian_style,
             log=log,
             progress=lambda frac, extra=None: translate_cb(frac, extra),
         )

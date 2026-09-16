@@ -106,6 +106,19 @@ HIGHLIGHT_STYLES = {
     "فقط بولد": "bold",
     "بدون تمایز": "none",
 }
+PERSIAN_STYLES = {
+    "تحت‌اللفظی (نزدیک به انگلیسی، ولی روان)": "literal",
+    "ساده، دوستانه و روان": "friendly",
+}
+ENGLISH_LEVELS = {
+    "اصلی (بدون تغییر)": "original",
+    "A1 — مبتدی": "A1",
+    "A2 — ابتدایی": "A2",
+    "B1 — متوسط": "B1",
+    "B2 — متوسط رو به بالا": "B2",
+    "C1 — پیشرفته": "C1",
+    "C2 — تسلط کامل (بدون تغییر)": "C2",
+}
 TTS_MODES = {
     "هم‌زمان با ویدیو": "timed",
     "پشت سر هم": "sequential",
@@ -434,7 +447,7 @@ class OutputsPanel(Card):
 class ProgressPanel(Card):
     """Shows one 0–100% bar per stage; the bar resets when a stage starts."""
 
-    STAGES = ["transcribe", "translate", "tts"]
+    STAGES = ["transcribe", "level_en", "translate", "tts"]
 
     def __init__(self, parent):
         super().__init__(parent, "روند پردازش")
@@ -638,9 +651,42 @@ class App(tk.Tk):
                   text="مدل‌های medium و large-v3 روی CPU بسیار کندتر از small و base هستند.",
                   style="Muted.TLabel").pack(anchor="e", pady=(8, 0))
 
+        # --- English subtitle level ---
+        self.english_card = Card(p, "متن زیرنویس انگلیسی")
+        self.english_card.pack(fill="x", pady=6)
+        erow = ttk.Frame(self.english_card.body, style="Card.TFrame")
+        erow.pack(fill="x")
+
+        ttk.Label(erow, text="سطح زبان (CEFR):", style="Card.TLabel").pack(side="right", padx=(0, 6))
+        saved_level = self.cfg.get("english_level", "original")
+        self.english_level_var = tk.StringVar(
+            value=next((k for k, v in ENGLISH_LEVELS.items() if v == saved_level), "اصلی (بدون تغییر)"))
+        ttk.Combobox(erow, textvariable=self.english_level_var, values=list(ENGLISH_LEVELS),
+                     state="readonly", width=28, font=FONT).pack(side="right")
+        self.english_level_var.trace_add("write", lambda *_: self._on_outputs_changed())
+
+        ttk.Label(self.english_card.body,
+                  text="اگه سطحی جز «اصلی» انتخاب کنی، متن انگلیسیِ روی صفحه بر اساس همون سطح "
+                       "ساده یا پیچیده‌تر می‌شه — این روی ترجمه‌ی فارسی هیچ اثری نداره؛ "
+                       "ترجمه همیشه از روی متن اصلی انجام می‌شه.",
+                  style="Muted.TLabel", wraplength=700, justify="right").pack(anchor="e", pady=(8, 0))
+
         # --- subtitle appearance ---
-        self.style_card = Card(p, "ظاهر زیرنویس فارسی")
+        self.style_card = Card(p, "زیرنویس فارسی")
         self.style_card.pack(fill="x", pady=6)
+
+        style_row = ttk.Frame(self.style_card.body, style="Card.TFrame")
+        style_row.pack(fill="x")
+        ttk.Label(style_row, text="سبک ترجمه:", style="Card.TLabel").pack(side="right", padx=(0, 6))
+        saved_persian_style = self.cfg.get("persian_style", "literal")
+        self.persian_style_var = tk.StringVar(
+            value=next((k for k, v in PERSIAN_STYLES.items() if v == saved_persian_style),
+                       list(PERSIAN_STYLES)[0]))
+        ttk.Combobox(style_row, textvariable=self.persian_style_var, values=list(PERSIAN_STYLES),
+                     state="readonly", width=34, font=FONT).pack(side="right")
+
+        ttk.Separator(self.style_card.body, orient="horizontal").pack(fill="x", pady=10)
+
         srow = ttk.Frame(self.style_card.body, style="Card.TFrame")
         srow.pack(fill="x")
 
@@ -659,7 +705,8 @@ class App(tk.Tk):
 
         ttk.Label(self.style_card.body,
                   text="اصطلاحاتی که آوانویسی شده‌اند (مثل «برپ سوییت») متمایز نمایش داده می‌شوند "
-                       "تا مشخص باشد ترجمه نیستند، بلکه همان واژه‌ی انگلیسی به خط فارسی‌اند.",
+                       "تا مشخص باشد ترجمه نیستند، بلکه همان واژه‌ی انگلیسی به خط فارسی‌اند.\n"
+                       "نکته: «صوت فارسی» هم دقیقاً از همین متن و همین سبک ترجمه ساخته می‌شود.",
                   style="Muted.TLabel", wraplength=700, justify="right").pack(anchor="e", pady=(8, 0))
 
         # --- TTS ---
@@ -739,8 +786,12 @@ class App(tk.Tk):
     # -- reactive UI -----------------------------------------------------
     def _on_outputs_changed(self):
         outputs = set(self.outputs_panel.get_outputs())
+        english_level = ENGLISH_LEVELS.get(self.english_level_var.get(), "original") \
+            if hasattr(self, "english_level_var") else "original"
 
         stages = ["transcribe"]
+        if pipeline.OUT_EN_SRT in outputs and english_level != "original":
+            stages.append("level_en")
         if outputs & {pipeline.OUT_FA_SRT, pipeline.OUT_FA_AUDIO}:
             stages.append("translate")
         if pipeline.OUT_FA_AUDIO in outputs:
@@ -749,15 +800,19 @@ class App(tk.Tk):
 
         # Only surface the settings that apply to the selected outputs, so the
         # window isn't cluttered with controls that would have no effect.
-        needs_gemini = bool(outputs & {pipeline.OUT_FA_SRT, pipeline.OUT_FA_AUDIO})
+        needs_gemini = bool(outputs & {pipeline.OUT_FA_SRT, pipeline.OUT_FA_AUDIO}) or \
+            (pipeline.OUT_EN_SRT in outputs and english_level != "original")
         self.keys_panel.pack_forget()
         self.models_panel.pack_forget()
         if needs_gemini:
             self.keys_panel.pack(fill="x", pady=6, before=self.file_card)
             self.models_panel.pack(fill="x", pady=6, before=self.file_card)
 
+        self.english_card.pack_forget()
         self.style_card.pack_forget()
         self.tts_card.pack_forget()
+        if pipeline.OUT_EN_SRT in outputs:
+            self.english_card.pack(fill="x", pady=6, before=self.progress_panel)
         if pipeline.OUT_FA_SRT in outputs:
             self.style_card.pack(fill="x", pady=6, before=self.progress_panel)
         if pipeline.OUT_FA_AUDIO in outputs:
@@ -803,6 +858,8 @@ class App(tk.Tk):
             "whisper_model": self.whisper_var.get(),
             "device": self.device_var.get(),
             "outputs": self.outputs_panel.get_outputs(),
+            "english_level": ENGLISH_LEVELS.get(self.english_level_var.get(), "original"),
+            "persian_style": PERSIAN_STYLES.get(self.persian_style_var.get(), "literal"),
             "highlight_style": HIGHLIGHT_STYLES.get(self.style_label_var.get(), "both"),
             "highlight_color": self.color_var.get().strip() or GOLD,
             "tts_voice": tts_mod.PERSIAN_VOICES.get(self.voice_label_var.get(),
@@ -834,9 +891,10 @@ class App(tk.Tk):
             messagebox.showerror("خطا", "حداقل یک خروجی را انتخاب کن.")
             return False
 
-        needs_api = bool(set(cfg["outputs"]) & {pipeline.OUT_FA_SRT, pipeline.OUT_FA_AUDIO})
+        needs_api = bool(set(cfg["outputs"]) & {pipeline.OUT_FA_SRT, pipeline.OUT_FA_AUDIO}) or \
+            (pipeline.OUT_EN_SRT in cfg["outputs"] and cfg["english_level"] not in (None, "original"))
         if needs_api and not cfg["api_keys"]:
-            messagebox.showerror("خطا", "برای خروجی فارسی باید حداقل یک کلید Gemini API وارد کنی.")
+            messagebox.showerror("خطا", "برای این خروجی‌ها باید حداقل یک کلید Gemini API وارد کنی.")
             return False
         if needs_api and not cfg["models_priority"]:
             messagebox.showerror("خطا", "حداقل یک مدل Gemini باید انتخاب شده باشد.")
@@ -882,6 +940,8 @@ class App(tk.Tk):
                 model_size=cfg["whisper_model"],
                 device=cfg["device"],
                 outputs=cfg["outputs"],
+                english_level=cfg["english_level"],
+                persian_style=cfg["persian_style"],
                 highlight_style=cfg["highlight_style"],
                 highlight_color=cfg["highlight_color"],
                 tts_voice=cfg["tts_voice"],

@@ -11,6 +11,14 @@ DEFAULT_CONFIG = {
     "device": "cpu",
     # Which deliverables to produce.
     "outputs": ["en_srt", "fa_srt"],
+    # CEFR level to rewrite the ENGLISH subtitle to ("original" = unchanged).
+    # This never affects the Persian translation, which always uses the
+    # original transcript.
+    "english_level": "original",
+    # Persian translation style: "literal" (close to English structure, still
+    # natural) or "friendly" (simple, casual, prioritizes ease of understanding).
+    # The Persian audio is always generated from this same text.
+    "persian_style": "literal",
     # How transliterated technical terms are marked in the Persian subtitle.
     "highlight_style": "both",      # color | bold | both | none
     "highlight_color": "#FFC857",

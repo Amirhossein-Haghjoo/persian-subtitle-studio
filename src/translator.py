@@ -260,7 +260,101 @@ def _chunk_texts(texts, max_lines: int, max_chars: int):
     return chunks
 
 
-def _build_prompt(numbered_input: str, context_block: str = "") -> str:
+def _run_batched(texts, api_keys, models_priority, build_prompt, build_single_prompt,
+                 log, progress, batch_size, chunk_char_budget, task_label="پردازش"):
+    """Shared batching/fallback engine used by both translate_lines() and
+    simplify_english_lines(). build_prompt(numbered_input, context_block) and
+    build_single_prompt(text) are supplied by the caller so this function
+    doesn't need to know whether it's translating or leveling text."""
+    total = len(texts)
+    if total == 0:
+        return []
+
+    chunks = _chunk_texts(texts, max_lines=batch_size, max_chars=chunk_char_budget)
+    multi_chunk = len(chunks) > 1
+    full_transcript = "\n".join(texts) if multi_chunk else None
+
+    result = []
+    start = 0
+
+    for chunk in chunks:
+        numbered_input = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chunk))
+
+        context_block = ""
+        if multi_chunk:
+            context_block = (
+                "For consistency across the whole video, here is the full transcript "
+                "as CONTEXT ONLY. Do not process it; only process the numbered lines "
+                "at the end.\n"
+                f"--- FULL TRANSCRIPT (context only) ---\n{full_transcript}\n"
+                "--- END CONTEXT ---\n\n"
+            )
+
+        log(f"{task_label} خطوط {start+1} تا {start+len(chunk)} از {total}...")
+        raw = _execute_with_fallback(api_keys, models_priority,
+                                     build_prompt(numbered_input, context_block), log)
+
+        lines_out = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r"^\d+[\.\)]\s*(.*)$", line)
+            lines_out.append(m.group(1).strip() if m else line)
+
+        if len(lines_out) != len(chunk):
+            log(f"  ⚠️ تعداد خطوط برگشتی ({len(lines_out)}) با ورودی ({len(chunk)}) "
+                "نخواند؛ این بخش خط‌به‌خط پردازش می‌شود...")
+            lines_out = _process_one_by_one(chunk, api_keys, models_priority,
+                                            build_single_prompt, log, progress, start, total)
+
+        result.extend(lines_out)
+        start += len(chunk)
+        if progress:
+            progress(min(start / total, 1.0), extra={"done": start, "total": total})
+
+    return result
+
+
+def _process_one_by_one(chunk, api_keys, models_priority, build_single_prompt,
+                        log, progress, start, total):
+    """Fallback path when a batch comes back with a mismatched line count."""
+    out = []
+    for j, t in enumerate(chunk):
+        try:
+            out.append(_execute_with_fallback(api_keys, models_priority,
+                                               build_single_prompt(t), log).strip())
+        except TranslationError as e:
+            log(f"  ⚠️ پردازش یک خط ناموفق بود، متن اصلی حفظ شد. ({e})")
+            out.append(t)
+        if progress:
+            done = start + j + 1
+            progress(min(done / total, 1.0), extra={"done": done, "total": total})
+    return out
+
+
+# --------------------------------------------------------------------------
+# Persian translation
+# --------------------------------------------------------------------------
+
+_STYLE_INSTRUCTIONS = {
+    "literal": (
+        "- Translation style: stay close to the English sentence structure and word "
+        "order where Persian grammar allows it, so a learner can map English to Persian. "
+        "This is NOT strict word-for-word substitution — the result must still be "
+        "correct, natural-sounding Persian that a native speaker would accept.\n"
+    ),
+    "friendly": (
+        "- Translation style: simple, warm, and conversational, like a friend explaining "
+        "it casually. Prefer short, everyday Persian words over formal/literary ones. "
+        "Reorder or simplify sentence structure freely if it makes the Persian easier to "
+        "understand — meaning matters more than closeness to the English wording.\n"
+    ),
+}
+
+
+def _build_translation_prompt(numbered_input: str, context_block: str = "",
+                              style: str = "literal") -> str:
     return (
         "You are translating subtitles from English to natural, fluent Persian (Farsi).\n"
         f"{context_block}"
@@ -269,6 +363,7 @@ def _build_prompt(numbered_input: str, context_block: str = "") -> str:
         "- Output ONLY the numbered Persian translations, nothing else.\n"
         "- Output PLAIN TEXT. No markdown, no asterisks, no backticks, no bold markers.\n"
         "- Write everything using ONLY Persian (Arabic) script. Do NOT use Latin letters.\n"
+        f"{_STYLE_INSTRUCTIONS.get(style, _STYLE_INSTRUCTIONS['literal'])}"
         "- Transliterate product/tool/technical names phonetically into Persian script "
         f"and wrap ONLY the transliterated term in {TERM_OPEN}...{TERM_CLOSE}, like this: "
         f"'Burp Suite' -> {TERM_OPEN}برپ سوییت{TERM_CLOSE}, "
@@ -284,16 +379,112 @@ def _build_prompt(numbered_input: str, context_block: str = "") -> str:
     )
 
 
-def translate_lines(texts, api_keys, models_priority=None,
+def _build_single_translation_prompt(text: str, style: str = "literal") -> str:
+    return (
+        "Translate this single subtitle line from English to natural, fluent Persian.\n"
+        "Output ONLY the translation, plain text, Persian script only.\n"
+        f"{_STYLE_INSTRUCTIONS.get(style, _STYLE_INSTRUCTIONS['literal'])}"
+        f"Wrap transliterated technical terms in {TERM_OPEN}...{TERM_CLOSE}.\n\n"
+        f"{text}"
+    )
+
+
+def translate_lines(texts, api_keys, models_priority=None, style: str = "literal",
                     batch_size: int = 60, chunk_char_budget: int = 4000,
                     log=print, progress=None):
     """Translates subtitle lines to Persian, preserving order and line count.
+
+    style: "literal" (close to English structure, still natural Persian) or
+    "friendly" (simple, casual, prioritizes ease of understanding).
 
     Returns raw lines that still contain «term» markers. Use to_styled() for the
     subtitle file and to_plain() for text-to-speech.
 
     progress, if given, is called as progress(fraction, extra={...}).
     """
+    api_keys, models_priority = _normalize_keys_and_models(api_keys, models_priority)
+    if style not in _STYLE_INSTRUCTIONS:
+        style = "literal"
+
+    return _run_batched(
+        texts, api_keys, models_priority,
+        build_prompt=lambda numbered, ctx: _build_translation_prompt(numbered, ctx, style),
+        build_single_prompt=lambda t: _build_single_translation_prompt(t, style),
+        log=log, progress=progress, batch_size=batch_size,
+        chunk_char_budget=chunk_char_budget, task_label="در حال ترجمه‌ی",
+    )
+
+
+# --------------------------------------------------------------------------
+# English CEFR leveling — rewrites the ENGLISH subtitle text to match a
+# language-learner's level. This only ever affects the English subtitle
+# output; the Persian translation always works from the original transcript,
+# independent of this setting.
+# --------------------------------------------------------------------------
+
+CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"]
+
+_CEFR_DESCRIPTIONS = {
+    "A1": "beginner: very short sentences, only the most common everyday words",
+    "A2": "elementary: simple everyday vocabulary, short clear sentences",
+    "B1": "intermediate: common vocabulary, moderate sentence length and complexity",
+    "B2": "upper-intermediate: wider vocabulary, some complex sentence structures allowed",
+    "C1": "advanced: natural, nuanced language, idiomatic where appropriate",
+}
+
+
+def _build_level_prompt(numbered_input: str, context_block: str, level: str) -> str:
+    desc = _CEFR_DESCRIPTIONS.get(level, _CEFR_DESCRIPTIONS["B1"])
+    return (
+        f"You are rewriting English subtitles for a language learner at CEFR level "
+        f"{level} ({desc}).\n"
+        f"{context_block}"
+        "Rules:\n"
+        "- Keep the EXACT SAME number of lines as input, with the same numbering.\n"
+        "- Output ONLY the numbered rewritten lines, nothing else.\n"
+        "- Output PLAIN TEXT, in English, no markdown.\n"
+        "- Preserve the core meaning and any technical/product names exactly as-is "
+        "(e.g., 'Burp Suite', 'SQL injection', 'Proxy') — do not translate or simplify names.\n"
+        f"- Adjust vocabulary and grammar complexity to match {level}.\n\n"
+        "Rewrite these lines:\n"
+        f"{numbered_input}"
+    )
+
+
+def _build_single_level_prompt(text: str, level: str) -> str:
+    desc = _CEFR_DESCRIPTIONS.get(level, _CEFR_DESCRIPTIONS["B1"])
+    return (
+        f"Rewrite this single English subtitle line for a language learner at CEFR "
+        f"level {level} ({desc}). Keep technical/product names as-is. "
+        f"Output ONLY the rewritten line, plain English text.\n\n{text}"
+    )
+
+
+def simplify_english_lines(texts, api_keys, models_priority=None, level: str = "B1",
+                           batch_size: int = 60, chunk_char_budget: int = 4000,
+                           log=print, progress=None):
+    """Rewrites English subtitle lines to match a CEFR proficiency level.
+
+    Pass level=None (or "original"/"C2") to skip processing entirely and get
+    the original lines back unchanged — advanced learners don't need this,
+    and it saves an API call.
+    """
+    if not level or level in ("original", "C2"):
+        return list(texts)
+
+    api_keys, models_priority = _normalize_keys_and_models(api_keys, models_priority)
+    level = level if level in CEFR_LEVELS else "B1"
+
+    return _run_batched(
+        texts, api_keys, models_priority,
+        build_prompt=lambda numbered, ctx: _build_level_prompt(numbered, ctx, level),
+        build_single_prompt=lambda t: _build_single_level_prompt(t, level),
+        log=log, progress=progress, batch_size=batch_size,
+        chunk_char_budget=chunk_char_budget, task_label=f"در حال ساده‌سازی ({level})",
+    )
+
+
+def _normalize_keys_and_models(api_keys, models_priority):
     if isinstance(api_keys, str):
         api_keys = [k.strip() for k in api_keys.split(",") if k.strip()]
     api_keys = [k.strip() for k in (api_keys or []) if k and k.strip()]
@@ -303,73 +494,4 @@ def translate_lines(texts, api_keys, models_priority=None,
     if isinstance(models_priority, str):
         models_priority = [m.strip() for m in models_priority.split(",") if m.strip()]
     models_priority = [m for m in (models_priority or []) if m] or list(DEFAULT_MODELS)
-
-    total = len(texts)
-    if total == 0:
-        return []
-
-    chunks = _chunk_texts(texts, max_lines=batch_size, max_chars=chunk_char_budget)
-    multi_chunk = len(chunks) > 1
-    full_transcript = "\n".join(texts) if multi_chunk else None
-
-    translated = []
-    start = 0
-
-    for chunk in chunks:
-        numbered_input = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chunk))
-
-        context_block = ""
-        if multi_chunk:
-            context_block = (
-                "For consistent terminology across the whole video, here is the full "
-                "English transcript as CONTEXT ONLY. Do not translate it; only translate "
-                "the numbered lines at the end.\n"
-                f"--- FULL TRANSCRIPT (context only) ---\n{full_transcript}\n"
-                "--- END CONTEXT ---\n\n"
-            )
-
-        log(f"در حال ترجمه‌ی خطوط {start+1} تا {start+len(chunk)} از {total}...")
-        raw = _execute_with_fallback(api_keys, models_priority,
-                                     _build_prompt(numbered_input, context_block), log)
-
-        lines_out = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            m = re.match(r"^\d+[\.\)]\s*(.*)$", line)
-            lines_out.append(m.group(1).strip() if m else line)
-
-        if len(lines_out) != len(chunk):
-            log(f"  ⚠️ تعداد خطوط برگشتی ({len(lines_out)}) با ورودی ({len(chunk)}) "
-                "نخواند؛ این بخش خط‌به‌خط ترجمه می‌شود...")
-            lines_out = _translate_one_by_one(chunk, api_keys, models_priority,
-                                              log, progress, start, total)
-
-        translated.extend(lines_out)
-        start += len(chunk)
-        if progress:
-            progress(min(start / total, 1.0), extra={"done": start, "total": total})
-
-    return translated
-
-
-def _translate_one_by_one(chunk, api_keys, models_priority, log, progress, start, total):
-    """Fallback path when a batch comes back with a mismatched line count."""
-    out = []
-    for j, t in enumerate(chunk):
-        prompt = (
-            "Translate this single subtitle line from English to natural, fluent Persian.\n"
-            "Output ONLY the translation, plain text, Persian script only.\n"
-            f"Wrap transliterated technical terms in {TERM_OPEN}...{TERM_CLOSE}.\n\n"
-            f"{t}"
-        )
-        try:
-            out.append(_execute_with_fallback(api_keys, models_priority, prompt, log).strip())
-        except TranslationError as e:
-            log(f"  ⚠️ ترجمه‌ی یک خط ناموفق بود، متن انگلیسی حفظ شد. ({e})")
-            out.append(t)
-        if progress:
-            done = start + j + 1
-            progress(min(done / total, 1.0), extra={"done": done, "total": total})
-    return out
+    return api_keys, models_priority
